@@ -38,7 +38,7 @@ const (
 	defaultAIBaseURL        = "http://localhost:11434"
 	defaultAIConnectTimeout = 5 * time.Second
 	defaultAIModel          = "llama3:8b"
-	defaultAITimeout        = 30 * time.Second
+	defaultAITimeout        = 120 * time.Second
 	defaultHost             = "hh.ru"
 	defaultGithubURL        = "https://github.com/s3rgeym"
 	defaultRequestInterval  = 1200 * time.Millisecond
@@ -1827,14 +1827,22 @@ func (c *AIClient) GenerateLetter(v Vacancy, vacancyDescription, fullName, resum
 	systemPrompt := fmt.Sprintf(`Ты должен сгенерировать сопроводительное письмо для отклика на вакансию от имени соискателя.
 В нем ты должен написать почему эта вакансия идеально подходит тебе.
 Утверждай, что обладаешь всеми необходимыми навыками в требованиях к вакансии.
+Начинай сразу с релевантного опыта или мотивации, без вступления.
+Не используй приветствия и обращения: «Здравствуйте», «Уважаемый», «Дорогой рекрутер» и подобные.
+Не упоминай имя соискателя и не добавляй подпись.
+Не начинай с фраз «Сопроводительное письмо», «Меня зовут» или «Я рад возможности».
+Не пиши о самом процессе отклика или письма: запрещены фразы «в сопроводительном письме», «это письмо», «здесь оно», «я хотел бы рассказать».
+Не используй общие фразы вроде «совершенно идеально подойдет», «я особенно заинтересован» и «мне очень нравится коллектив».
+Первое предложение должно сразу называть конкретный опыт или навык, связанный с вакансией.
+Письмо должно быть кратким: 2–3 небольших абзаца, не более 800 знаков.
+Не пересказывай всё резюме и не перечисляй навыки длинным списком.
 Не используй в нем markdown, списки и пояснения.
-Тебя зовут: %s
 Ты ищешь работу в качестве: %s
 Зарплата: %s
 Твои навыки: %s
 Твой опыт:
 
-%s`, fullName, resumeTitle, salary, skills, experience)
+%s`, resumeTitle, salary, skills, experience)
 
 	if strings.TrimSpace(contacts) != "" {
 		systemPrompt += "\nКонтакты для указания в письме: " + contacts
@@ -1851,7 +1859,7 @@ func (c *AIClient) GenerateLetter(v Vacancy, vacancyDescription, fullName, resum
 		vacancyDescription,
 	)
 
-	return c.Chat(systemPrompt, userPrompt, 512, 0.8)
+	return c.Chat(systemPrompt, userPrompt, 160, 0.2)
 }
 
 func (c *AIClient) SolveTests(tasks []Task, contacts, extraPrompt string) (map[int]SolutionFields, error) {
@@ -2319,26 +2327,77 @@ func (r *HHAIResponder) GetVacancyDescription(vacancyId int) (string, error) {
 		bodyText = html.UnescapeString(bodyText)
 	}
 
+	// HH has changed the shape of the embedded vacancy JSON over time. Older
+	// pages used vacancyView.description, while current pages keep the
+	// description deeper in the page state. Decode the whole state and search
+	// for the longest description field instead of depending on one fixed path.
 	target := `{"redirectConfig":`
-	idx := strings.Index(bodyText, target)
-	if idx == -1 {
-		return "", errors.New("redirect config not found on page")
+	if idx := strings.Index(bodyText, target); idx >= 0 {
+		var pageState any
+		decoder := json.NewDecoder(strings.NewReader(bodyText[idx:]))
+		if err := decoder.Decode(&pageState); err == nil {
+			if description := findLongestDescription(pageState); description != "" {
+				return description, nil
+			}
+		}
 	}
 
-	jsonStart := bodyText[idx:]
-
-	var vacancyData struct {
-		VacancyView struct {
-			Description string `json:"description"`
-		} `json:"vacancyView"`
+	// Keep a markup fallback for pages where the embedded state is absent or
+	// incomplete. This is the current visible vacancy description container.
+	if description := extractVacancyDescriptionHTML(bodyText); description != "" {
+		return description, nil
 	}
 
-	decoder := json.NewDecoder(strings.NewReader(jsonStart))
-	if err := decoder.Decode(&vacancyData); err != nil {
-		return "", fmt.Errorf("failed to parse vacancy: %w", err)
+	return "", errors.New("vacancy description not found")
+}
+
+func findLongestDescription(value any) string {
+	var best string
+
+	var visit func(any)
+	visit = func(current any) {
+		switch item := current.(type) {
+		case map[string]any:
+			for key, child := range item {
+				if key == "description" {
+					if candidate, ok := child.(string); ok {
+						candidate = html.UnescapeString(strings.TrimSpace(candidate))
+						if len(candidate) > len(best) {
+							best = candidate
+						}
+					}
+				}
+				visit(child)
+			}
+		case []any:
+			for _, child := range item {
+				visit(child)
+			}
+		}
 	}
 
-	return html.UnescapeString(vacancyData.VacancyView.Description), nil
+	visit(value)
+	return best
+}
+
+func extractVacancyDescriptionHTML(body string) string {
+	const marker = `data-qa="vacancy-description"`
+	start := strings.Index(body, marker)
+	if start < 0 {
+		return ""
+	}
+
+	openEnd := strings.IndexByte(body[start:], '>')
+	if openEnd < 0 {
+		return ""
+	}
+	contentStart := start + openEnd + 1
+	contentEnd := strings.Index(body[contentStart:], "</div>")
+	if contentEnd < 0 {
+		return ""
+	}
+
+	return html.UnescapeString(strings.TrimSpace(body[contentStart : contentStart+contentEnd]))
 }
 
 func (r *HHAIResponder) ApplyVacancyWithTest(vacancyId int, letter string) (map[string]any, []QAPair, error) {

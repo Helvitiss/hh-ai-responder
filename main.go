@@ -81,6 +81,7 @@ type Config struct {
 	Contacts                string
 	ListResumes             bool
 	ForceLetter             bool
+	DryRun                  bool
 	ExtraChatReplyPrompt    string
 }
 
@@ -174,6 +175,7 @@ type ApplyResult struct {
 	AppliedAt      time.Time `json:"applied_at"`
 	ResponsesCount int       `json:"responses_count"`
 	TestSolutions  []QAPair  `json:"test_solutions,omitempty"`
+	DryRun         bool      `json:"dry_run,omitempty"`
 }
 
 type ChatResult struct {
@@ -1245,7 +1247,22 @@ func (r *HHAIResponder) AutoRespondChats() error {
 
 		logger.Debug("Reply to chat #%d:\n%s\n%s", chatToReply.ChatId, chatToReply.ReplyToMessage, reply)
 
+		if r.dryRun {
+			logger.Info("Dry-run: chat reply skipped #%d", chatToReply.ChatId)
+			r.writeEvent(ChatResult{
+				Type:        "chat_reply_preview",
+				Resume:      chatToReply.ResumeHash,
+				ResumeTitle: chatToReply.ResumeTitle,
+				ChatId:      chatToReply.ChatId,
+				EmployerMsg: chatToReply.ReplyToMessage,
+				Reply:       reply,
+				SentAt:      time.Now(),
+			})
+			continue
+		}
+
 		if _, err := r.SendChatMessage(chatToReply.ChatId, reply); err != nil {
+
 			logger.Error("Failed reply to chat #%d: %v", chatToReply.ChatId, err)
 
 			r.writeEvent(ErrorResult{
@@ -1339,6 +1356,7 @@ type HHAIResponder struct {
 	contacts                string
 	outputPath              string
 	forceLetter             bool
+	dryRun                  bool
 	extraChatReplyPrompt    string
 	chatURL                 string
 	resumeProfileFrontURL   string
@@ -1575,6 +1593,7 @@ func NewHHAIResponder(ctx context.Context, cfg Config) (*HHAIResponder, error) {
 		contacts:                cfg.Contacts,
 		outputPath:              cfg.OutputPath,
 		forceLetter:             cfg.ForceLetter,
+		dryRun:                  cfg.DryRun,
 		extraChatReplyPrompt:    cfg.ExtraChatReplyPrompt,
 	}
 
@@ -1859,7 +1878,88 @@ func (c *AIClient) GenerateLetter(v Vacancy, vacancyDescription, fullName, resum
 		vacancyDescription,
 	)
 
-	return c.Chat(systemPrompt, userPrompt, 160, 0.2)
+	letter, err := c.Chat(systemPrompt, userPrompt, 160, 0.2)
+	if err != nil {
+		return "", err
+	}
+
+	return normalizeGeneratedLetter(letter, fullName)
+}
+
+func normalizeGeneratedLetter(letter, fullName string) (string, error) {
+	letter = strings.TrimSpace(strings.Trim(letter, "`"))
+	if letter == "" {
+		return "", errors.New("AI returned an empty letter")
+	}
+
+	// Remove common meta-introductions when the model adds them despite the
+	// prompt. Drop whole leading paragraphs so the actual letter starts cleanly.
+	metaPrefixes := []string{
+		"здравствуйте",
+		"уважаемый",
+		"уважаемая",
+		"уважаемые",
+		"дорогой",
+		"дорогая",
+		"дорогие",
+		"сопроводительное письмо",
+		"в сопроводительном письме",
+		"вот сопроводительное письмо",
+		"соглашение на вакансию",
+		"меня зовут",
+		"я рад возможности",
+	}
+
+	paragraphs := strings.Split(letter, "\n\n")
+	for len(paragraphs) > 0 {
+		first := strings.ToLower(strings.TrimSpace(paragraphs[0]))
+		first = strings.TrimLeft(first, "*- \t")
+		remove := false
+		for _, prefix := range metaPrefixes {
+			if strings.HasPrefix(first, prefix) {
+				remove = true
+				break
+			}
+		}
+		if !remove {
+			break
+		}
+		paragraphs = paragraphs[1:]
+	}
+
+	for len(paragraphs) > 0 {
+		last := strings.ToLower(strings.TrimSpace(paragraphs[len(paragraphs)-1]))
+		if strings.HasPrefix(last, "с уважением") || strings.HasPrefix(last, "с наилучшими пожеланиями") {
+			paragraphs = paragraphs[:len(paragraphs)-1]
+			continue
+		}
+		break
+	}
+
+	letter = strings.TrimSpace(strings.Join(paragraphs, "\n\n"))
+	if fullName != "" {
+		letter = strings.ReplaceAll(letter, fullName, "")
+	}
+
+	lower := strings.ToLower(letter)
+	for _, forbidden := range []string{
+		"в сопроводительном письме",
+		"это письмо",
+		"здесь оно",
+		"сопроводительное письмо:",
+		"совершенно идеально подойдет",
+		"я особенно заинтересован",
+	} {
+		if strings.Contains(lower, forbidden) {
+			return "", fmt.Errorf("generated letter contains forbidden phrase %q", forbidden)
+		}
+	}
+
+	if letter == "" {
+		return "", errors.New("letter became empty after normalization")
+	}
+
+	return letter, nil
 }
 
 func (c *AIClient) SolveTests(tasks []Task, contacts, extraPrompt string) (map[int]SolutionFields, error) {
@@ -2584,6 +2684,23 @@ func (r *HHAIResponder) ApplyVacancies() error {
 				logger.Debug("Coverage letter:\n\n%s", letter)
 			}
 
+			if r.dryRun {
+				logger.Info("Dry-run: application skipped %d: %s", vacancy.ID, vacancyURL)
+				r.writeEvent(ApplyResult{
+					Type:           "application_preview",
+					Resume:         r.resumeHash,
+					ResumeTitle:    resume.Title,
+					VacancyID:      vacancy.ID,
+					URL:            vacancyURL,
+					Name:           vacancy.Name,
+					Letter:         letter,
+					AppliedAt:      time.Now(),
+					ResponsesCount: vacancy.TotalResponsesCount,
+					DryRun:         true,
+				})
+				continue
+			}
+
 			var responseResult map[string]any
 			var solutions []QAPair
 			if vacancy.UserTestPresent {
@@ -2965,6 +3082,7 @@ func parseConfig() (Config, error) {
 	flag.IntVar(&cfg.MaxResponses, "mr", 0, "Пропускать вакансии с количеством откликов больше N")
 	flag.BoolVar(&cfg.ListResumes, "R", false, "Показать список резюме и выйти")
 	flag.BoolVar(&cfg.ForceLetter, "force-letter", false, "Всегда генерировать сопроводительное письмо")
+	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Генерировать письма и ответы без отправки")
 	flag.DurationVar(&cfg.AITimeout, "ai-timeout", defaultAITimeout, "Общий таймаут AI-запроса: соединение и чтение ответа")
 	flag.DurationVar(&cfg.AIConnectTimeout, "ai-connect-timeout", defaultAIConnectTimeout, "Таймаут соединения с AI-сервером")
 	flag.DurationVar(&cfg.RequestInterval, "request-interval", defaultRequestInterval, "Минимальный интервал между запросами к hh.ru")
@@ -3124,6 +3242,9 @@ func (r *HHAIResponder) Run() {
 
 	// Touch resume loop (every 4h after completion)
 	go func() {
+		if r.dryRun {
+			return
+		}
 		for {
 			select {
 			case <-r.ctx.Done():
@@ -3149,6 +3270,9 @@ func (r *HHAIResponder) Run() {
 	}()
 
 	go func() {
+		if r.dryRun {
+			return
+		}
 		for {
 			select {
 			case <-r.ctx.Done():
